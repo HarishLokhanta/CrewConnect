@@ -13,6 +13,15 @@ type ConvState = {
   budget_band?: string;
   tasks?: any[];
   crew_options?: any[];
+
+  // NEW: coords + locality
+  lat?: number;
+  lng?: number;
+  suburb?: string;
+  postcode?: string;
+  city?: string;
+  state_long?: string;
+  country?: string;
 };
 
 
@@ -66,6 +75,35 @@ function formatTimeNow() {
   } catch {
     return "";
   }
+}
+// Forward geocode any free text / Plus Code → lat/lng (OpenStreetMap Nominatim)
+async function geocodeAddress(text: string): Promise<{
+  lat:number; lng:number; display_name:string;
+  suburb?:string; postcode?:string; city?:string; state_long?:string; country?:string;
+} | null> {
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(text)}&addressdetails=1&limit=1`;
+    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    const arr = await r.json();
+    const hit = Array.isArray(arr) ? arr[0] : null;
+    if (!hit) return null;
+    const a = hit.address || {};
+    return {
+      lat: Number(hit.lat),
+      lng: Number(hit.lon),
+      display_name: hit.display_name,
+      suburb: a.suburb || a.neighbourhood || a.village || a.town || a.city_district,
+      postcode: a.postcode,
+      city: a.city || a.town || a.village,
+      state_long: a.state,
+      country: a.country,
+    };
+  } catch { return null; }
+}
+
+// Detect Plus Codes like "455V+W6 Darlington, New South Wales"
+function looksLikePlusCode(s: string) {
+  return /^[23456789CFGHJMPQRVWX]{2,8}\+?[23456789CFGHJMPQRVWX]{2,8}/i.test(s);
 }
 
 // --- localStorage helpers ---
@@ -361,6 +399,17 @@ export default function CrewConnectPage() {
 
       // send address back into chat
       setShowLocationPrompt(false);
+        setState(s => ({
+          ...s,
+          address,
+          lat: latitude,
+          lng: longitude,
+          suburb: data?.address?.suburb || data?.address?.neighbourhood || s.suburb,
+          postcode: data?.address?.postcode || s.postcode,
+          city: data?.address?.city || data?.address?.town || s.city,
+          state_long: data?.address?.state || s.state_long,
+          country: data?.address?.country || s.country
+        }));
       await sendMessage(address);
     } catch (err: any) {
       setLocationError(err?.message || "Couldn’t get your location.");
@@ -368,6 +417,67 @@ export default function CrewConnectPage() {
       setLocationWorking(false);
     }
   };
+
+  // === RUN MATCHER USING CURRENT LOCATION (lat/lng in state) ===
+  async function runOptimiseUsingCurrentLocation() {
+    try {
+      // Ensure we have coords; if address only, forward-geocode once
+      let { lat, lng } = state;
+      if ((!lat || !lng) && state.address?.trim()) {
+        const geo = await geocodeAddress(state.address.trim());
+        if (geo) {
+          lat = geo.lat; lng = geo.lng;
+          setState(s => ({ ...s, lat, lng, address: geo.display_name,
+            suburb: geo.suburb || s.suburb, postcode: geo.postcode || s.postcode,
+            city: geo.city || s.city, state_long: geo.state_long || s.state_long, country: geo.country || s.country
+          }));
+        }
+      }
+      if (!lat || !lng) {
+        setMessages(m => [...m, { role: "assistant", text: "I need your location. Click ‘Use my location’ or type your address." }]);
+        return;
+      }
+
+      // Simple demo tasks. Swap these if you already have a job flow.
+      const body = {
+        title: 'Bathroom refresh',
+        lat, lng,
+        urgency: 'scheduled',
+        window_start: new Date().toISOString(),
+        window_end: new Date(Date.now() + 4*3600*1000).toISOString(),
+        budget_max: 5000,
+        tasks: [
+          { name:'Waterproof',       skill:'waterproof',  duration_h:4, order_idx:0 },
+          { name:'Tiling',           skill:'tiler',       duration_h:8, order_idx:1 },
+          { name:'Power fit-off',    skill:'electrician', duration_h:1, order_idx:2 },
+          { name:'Plumber fit-off',  skill:'plumber',     duration_h:3, order_idx:3 },
+        ]
+      };
+
+      const r = await fetch('/api/projects/optimise', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const j = await r.json();
+
+      if (j.status === 'ok') {
+        const lines = Object.entries(j.picks || {}).map(([task, w]: any) => `• ${task}: ${w.name}`);
+        setMessages(m => [
+          ...m,
+          { role: 'status', text: '✅ Found matching crew near you:' },
+          { role: 'assistant', text: lines.join('\n') }
+        ]);
+      } else {
+        setMessages(m => [
+          ...m,
+          { role: 'assistant', text: `No match yet for ${j.task || 'your request'}. Try Weekday or higher budget.` }
+        ]);
+      }
+    } catch (e:any) {
+      setMessages(m => [...m, { role: 'assistant', text: `Match error: ${e?.message || e}` }]);
+    }
+  }
 
   // Memoized chat title based on first user message
   const chatTitle = useMemo(() => {
@@ -452,6 +562,14 @@ export default function CrewConnectPage() {
               style={{ fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif' }}
             >
               Project Summary
+            </button>
+
+            <button
+              onClick={runOptimiseUsingCurrentLocation}
+              className="ml-2 text-sm underline-offset-4 hover:underline"
+              style={{ fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif' }}
+            >
+              Find nearest crew
             </button>
           </div>
 
@@ -870,5 +988,6 @@ function LocationModal({
     </div>
 
   );
+
 
 }

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin as sb } from '@/lib/supabaseAdmin';
-import { feasible, pairCost } from '@/lib/matcher';
+import { supabaseAdmin as sb } from '../../../../lib/supabaseAdmin';
+import { feasible, pairCost } from '@/src/lib/matcher';
 
 export async function POST(req: NextRequest){
   const job = await req.json();
