@@ -634,7 +634,14 @@ export default function CrewConnectPage() {
                   />
                 ))}
                 {sending && <TypingIndicator />}
-                {proposal && <MatchingProposal proposal={proposal} dark={dark} />}
+                {proposal && (
+                  <MatchingProposal
+                    proposal={proposal}
+                    dark={dark}
+                    state={state}
+                    messages={messages}
+                  />
+                )}
                 <div ref={bottomAnchorRef} />
               </div>
             )}
@@ -751,7 +758,33 @@ function Hero({ onPick, dark }: { onPick: (t: string) => void; dark: boolean }) 
     </div>
   );
 }
-function MatchingProposal({ proposal, dark }: { proposal: { resp: any; body: any }; dark: boolean }) {
+function MatchingProposal({
+  proposal,
+  dark,
+  state,
+  messages,
+}: {
+  proposal: { resp: any; body: any };
+  dark: boolean;
+  state: any;
+  messages: Msg[];
+}) {
+  // Derive booking summary fields from conversation state
+  const firstUserMessage = Array.isArray(messages)
+    ? messages.find((m) => m.role === "user")
+    : undefined;
+
+  const projectTitle =
+    (state?.job_description && String(state.job_description).trim()) ||
+    (firstUserMessage?.text && String(firstUserMessage.text).trim()) ||
+    (proposal?.body?.title || "Project");
+
+  const timelineText =
+    (state?.time_window && String(state.time_window).trim()) ||
+    "Start Tue · Finish Sun";
+
+  const chosenBudgetLabel =
+    (state?.budget_band && String(state.budget_band).trim()) || "";
   const { resp, body } = proposal;
 
   const [tab, setTab] = React.useState<'cheapest' | 'fastest' | 'greenest'>('cheapest');
@@ -788,8 +821,6 @@ function MatchingProposal({ proposal, dark }: { proposal: { resp: any; body: any
   } catch {}
 
   const crewNames = crew.map(c => c.name).filter(Boolean).join(', ');
-  const projectTitle = body?.title || 'Bathroom Retile';
-  const timelineText = 'Start Tue · Finish Sun';
 
   return (
     <div
@@ -965,8 +996,9 @@ function MatchingProposal({ proposal, dark }: { proposal: { resp: any; body: any
           onClose={() => setShowBooking(false)}
           title={projectTitle}
           timeline={timelineText}
-          minBudget={minBudget}
-          maxBudget={maxBudget}
+          priceLabel={
+            chosenBudgetLabel || `$ ${minBudget.toLocaleString()}–$${maxBudget.toLocaleString()}`
+          }
           crewNames={crewNames}
           badge={tab === 'cheapest' ? 'Best Value' : tab === 'fastest' ? 'Quickest' : 'Most Sustainable'}
           dark={dark}
@@ -980,8 +1012,7 @@ function BookingModal({
   onClose,
   title,
   timeline,
-  minBudget,
-  maxBudget,
+  priceLabel,
   crewNames,
   badge,
   dark
@@ -989,8 +1020,7 @@ function BookingModal({
   onClose: () => void;
   title: string;
   timeline: string;
-  minBudget: number;
-  maxBudget: number;
+  priceLabel: string;
   crewNames: string;
   badge: string;
   dark: boolean;
@@ -1023,7 +1053,7 @@ function BookingModal({
             <div className="px-4 py-3 flex items-start justify-between">
               <div className="text-gray-500">Price:</div>
               <div className="text-right">
-                <div className="font-semibold">${minBudget.toLocaleString()}–${maxBudget.toLocaleString()}</div>
+                <div className="font-semibold">{priceLabel || "—"}</div>
                 <div className="text-[11px] text-gray-500 text-right">Estimate ±12%</div>
               </div>
             </div>
