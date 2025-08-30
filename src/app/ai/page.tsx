@@ -113,6 +113,8 @@ const keyState = (id: string) => `cc_chat_${id}_state`;
 function readJSON<T>(key: string, fallback: T): T {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) as T : fallback; } catch { return fallback; }
 }
+// cancels in-flight network calls when you switch chats or send again
+
 function writeJSON(key: string, value: any) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
@@ -146,7 +148,17 @@ export default function CrewConnectPage() {
   const locationPromptOnce = useRef(false); // avoid popping repeatedly
   const [showSummary, setShowSummary] = useState(false);
   const initialKickoffDone = useRef(false);
+  const activeControllerRef = useRef<AbortController | null>(null);
 
+// increases each time we switch chats / cancel; late responses are ignored
+  const chatEpochRef = useRef(0);
+
+  function cancelInFlight() {
+    try { activeControllerRef.current?.abort(); } catch {}
+    activeControllerRef.current = null;
+    chatEpochRef.current += 1;     // invalidate late responses
+    setSending(false);
+  }
 
   // scrolling
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -234,6 +246,7 @@ export default function CrewConnectPage() {
 
   // Helper to create a new chat
   const newChat = () => {
+    cancelInFlight();
     const id = (typeof crypto !== 'undefined' && 'randomUUID' in crypto) ? (crypto as any).randomUUID() : String(Date.now());
     const item: ChatItem = { id, title: 'New Chat', meta: 'Just now', dot: 'gray' };
     // persist
@@ -256,6 +269,7 @@ export default function CrewConnectPage() {
 
   // Helper to open a chat (clear UI, load, and set dot green)
   const openChat = async (id: string) => {
+    cancelInFlight();
     setLoadingChat(true);
     setCurrentChatId(id);
     // clear
@@ -279,6 +293,12 @@ export default function CrewConnectPage() {
 
   // Unified sender (text or chip)
   const sendMessage = async (text: string) => {
+    setInput("");
+    cancelInFlight(); // stop any previous request
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    const myEpoch = chatEpochRef.current;
+    setSending(true);
     if (!text.trim() || sending) return;
     const userMsg: Msg = { role: "user", text: text.trim() };
     if (!currentChatId) {
@@ -422,6 +442,10 @@ export default function CrewConnectPage() {
   async function runOptimiseUsingCurrentLocation() {
     try {
       // Ensure we have coords; if address only, forward-geocode once
+      cancelInFlight();
+      const controller = new AbortController();
+      activeControllerRef.current = controller;
+      const myEpoch = chatEpochRef.current;
       let { lat, lng } = state;
       if ((!lat || !lng) && state.address?.trim()) {
         const geo = await geocodeAddress(state.address.trim());
