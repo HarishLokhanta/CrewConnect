@@ -3,11 +3,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Sun, Moon, Camera } from "lucide-react";
 import Image from "next/image";
-import { createClient } from "@supabase/supabase-js";
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL as string,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY as string,
-);
 
 /* ---------------- types ---------------- */
 type Msg = { role: "user" | "assistant" | "status"; text: string; options?: string[] };
@@ -73,6 +68,17 @@ function formatTimeNow() {
   }
 }
 
+// --- localStorage helpers ---
+const STORAGE_CHATS = 'cc_chats';
+const keyMessages = (id: string) => `cc_chat_${id}_messages`;
+const keyState = (id: string) => `cc_chat_${id}_state`;
+function readJSON<T>(key: string, fallback: T): T {
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) as T : fallback; } catch { return fallback; }
+}
+function writeJSON(key: string, value: any) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
+
 /* --------------- page ----------------- */
 export default function CrewConnectPage() {
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -87,7 +93,6 @@ export default function CrewConnectPage() {
   type ChatItem = { id: string; title: string; meta: string; dot: "gray" | "black" | "green" };
   const [chats, setChats] = useState<ChatItem[]>([]);
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
-  const [userId, setUserId] = useState<string | null>(null);
   const prevChatIdRef = useRef<string | null>(null);
 
   const [dark, setDark] = useState(false);
@@ -102,20 +107,46 @@ export default function CrewConnectPage() {
   const [locationError, setLocationError] = useState<string | null>(null);
   const locationPromptOnce = useRef(false); // avoid popping repeatedly
   const [showSummary, setShowSummary] = useState(false);
+  const initialKickoffDone = useRef(false);
 
 
   // scrolling
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const handlePickFiles = () => fileInputRef.current?.click();
+  const handleFilesChosen = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const names = files.map(f => f.name).join(', ');
+    const msg: Msg = { role: 'status', text: `📎 Uploaded: ${names}` };
+
+    // show in UI
+    setMessages(m => [...m, msg]);
+
+    // persist to current chat (localStorage)
+    if (currentChatId) {
+      const cur = readJSON<Msg[]>(keyMessages(currentChatId), []);
+      writeJSON(keyMessages(currentChatId), [...cur, msg]);
+    }
+
+    // allow re-selecting the same file(s)
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
   useEffect(() => {
     bottomAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, sending]);
 
-  // Auto-kickoff: ask first question if user hasn't typed
+  // Auto-kickoff: only on first load when there are no chats and no current chat.
   useEffect(() => {
+    if (initialKickoffDone.current) return;            // already ran once
+    if (currentChatId) return;                         // a chat is selected (switching) → do NOT kickoff
+    if (chats.length > 0) return;                      // user has existing chats → do NOT kickoff
+    if (messages.length > 0) return;                   // something already rendered
+
     let cancel = false;
+    initialKickoffDone.current = true;                 // lock
+    setSending(true);
     (async () => {
-      if (messages.length > 0) return;
-      setSending(true);
       try {
         const r = await fetch("/api/predict-ui", {
           method: "POST",
@@ -140,51 +171,17 @@ export default function CrewConnectPage() {
       }
     })();
     return () => { cancel = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentChatId, chats.length, messages.length, state]);
 
-  // Get the current user and load chats on mount
+  // Load chats from localStorage on mount
   useEffect(() => {
-    (async () => {
-      const { data, error } = await supabase.auth.getUser();
-      if (error) {
-        console.warn("Supabase auth error", error.message);
-        return;
-      }
-      setUserId(data.user?.id ?? null);
-      if (data.user?.id) {
-        // Load existing chats for this user
-        const { data: rows } = await supabase
-          .from("v_chats_with_last_activity")
-          .select("*")
-          .eq("user_id", data.user.id)
-          .order("last_message_at", { ascending: false, nullsFirst: false });
-        if (rows && Array.isArray(rows)) {
-          setChats(rows.map((r: any) => ({
-            id: r.id,
-            title: r.title,
-            meta: new Date(r.updated_at || r.created_at).toLocaleString(),
-            dot: (r.status_dot as "gray" | "black" | "green") ?? "gray",
-          })));
-        }
-        if (!rows || rows.length === 0) {
-          // Fallback: load from legacy simple_chats
-          const { data: scRows, error: scErr } = await supabase
-            .from('simple_chats')
-            .select('id, user_key, title, updated_at, created_at')
-            .eq('user_key', data.user.id)
-            .order('updated_at', { ascending: false });
-          if (!scErr && scRows && scRows.length) {
-            setChats(scRows.map((r: any) => ({
-              id: r.id,
-              title: r.title || 'New Chat',
-              meta: new Date(r.updated_at || r.created_at).toLocaleString(),
-              dot: 'gray' as const,
-            })));
-          }
-        }
-      }
-    })();
+    const saved = readJSON<ChatItem[]>(STORAGE_CHATS, []);
+    if (saved.length) {
+      // normalize fields
+      setChats(saved.map((r) => ({ id: r.id, title: r.title || 'New Chat', meta: r.meta || new Date().toLocaleString(), dot: 'gray' })));
+    }
+    // Optionally auto-open the last selected chat
+    // if (saved[0]) openChat(saved[0].id);
   }, []);
 
   // If assistant asks for address, offer location modal (once per session)
@@ -196,114 +193,48 @@ export default function CrewConnectPage() {
     }
   }, [messages, state.address]);
 
-  // Helper to migrate a legacy simple_chats row into chats + messages
-  const migrateSimpleChatIfNeeded = async (id: string) => {
-    // See if a chats row already exists
-    const { data: exists } = await supabase.from('chats').select('id').eq('id', id).maybeSingle();
-    if (exists?.id) return; // already migrated/created
-
-    // Load the legacy row
-    const { data: sc, error: scErr } = await supabase
-      .from('simple_chats')
-      .select('id, user_key, title, transcript')
-      .eq('id', id)
-      .maybeSingle();
-    if (scErr || !sc) return;
-
-    // Create a chats row reusing the same id so links remain consistent
-    const insertChat = {
-      id: sc.id,
-      user_id: sc.user_key,
-      title: sc.title || 'New Chat',
-      status_dot: 'gray' as const,
-    } as any;
-    await supabase.from('chats').insert(insertChat);
-
-    // Convert transcript and bulk insert messages
-    const msgs = transcriptToMessages(sc.transcript).map((m) => ({
-      chat_id: sc.id,
-      role: m.role,
-      text: m.text,
-      options: m.options ?? [],
-    }));
-    if (msgs.length) {
-      // Insert in reasonable batches to avoid payload limits
-      const batchSize = 500;
-      for (let i = 0; i < msgs.length; i += batchSize) {
-        const chunk = msgs.slice(i, i + batchSize);
-        await supabase.from('messages').insert(chunk);
-      }
-    }
-  };
 
   // Helper to create a new chat
   const newChat = () => {
-    const id = String(Date.now());
-    const item: ChatItem = { id, title: "New Chat", meta: "Just now", dot: "gray" };
-    setChats((c) => [item, ...c]);
+    const id = (typeof crypto !== 'undefined' && 'randomUUID' in crypto) ? (crypto as any).randomUUID() : String(Date.now());
+    const item: ChatItem = { id, title: 'New Chat', meta: 'Just now', dot: 'gray' };
+    // persist
+    const list = readJSON<ChatItem[]>(STORAGE_CHATS, []);
+    writeJSON(STORAGE_CHATS, [item, ...list]);
+    writeJSON(keyMessages(id), []);
+    writeJSON(keyState(id), { job_description: '', address: '', time_window: '', budget_band: '', tasks: [], crew_options: [] });
+    // state
+    setChats((c) => {
+      const updated = [{ ...item, dot: 'green' as const }, ...c.map(it => ({ ...it, dot: 'gray' as const }))];
+      writeJSON(STORAGE_CHATS, updated);
+      return updated;
+    });
+    setCurrentChatId(id);
     setCurrentChatId(id);
     setMessages([]);
-    setState({ job_description: "", address: "", time_window: "", budget_band: "", tasks: [], crew_options: [] });
+    setState({ job_description: '', address: '', time_window: '', budget_band: '', tasks: [], crew_options: [] });
     locationPromptOnce.current = false;
   };
 
-  // Helper to open a chat (clear UI, migrate legacy if needed, load, and set dot green)
+  // Helper to open a chat (clear UI, load, and set dot green)
   const openChat = async (id: string) => {
     setLoadingChat(true);
     setCurrentChatId(id);
-    // Clear current UI so it feels like a page refresh
+    // clear
     setMessages([]);
     setState({ job_description: '', address: '', time_window: '', budget_band: '', tasks: [], crew_options: [] });
-
-    // Ensure a normalized chat exists; migrate if needed
-    await migrateSimpleChatIfNeeded(id);
-
-    // Load messages from normalized table
-    const { data: msgs } = await supabase
-      .from('messages')
-      .select('role, text, options, created_at')
-      .eq('chat_id', id)
-      .order('created_at', { ascending: true });
-    if (Array.isArray(msgs) && msgs.length) {
-      setMessages(msgs.map((m: any) => ({ role: m.role as Msg['role'], text: m.text as string, options: (m.options as string[]) || [] })));
-    } else {
-      // Fallback: legacy transcript if messages still empty
-      const { data: scRow } = await supabase
-        .from('simple_chats')
-        .select('transcript')
-        .eq('id', id)
-        .maybeSingle();
-      if (scRow?.transcript) {
-        const legacy = transcriptToMessages(scRow.transcript);
-        if (legacy.length) setMessages(legacy);
-      }
-    }
-
-    // Load chat state if exists
-    const { data: chatRows } = await supabase
-      .from('chats')
-      .select('job_description, address, time_window, budget_band, tasks, crew_options, notes')
-      .eq('id', id)
-      .limit(1)
-      .maybeSingle();
-    if (chatRows) {
-      setState({
-        job_description: chatRows.job_description ?? '',
-        address: chatRows.address ?? '',
-        time_window: chatRows.time_window ?? '',
-        budget_band: chatRows.budget_band ?? '',
-        tasks: chatRows.tasks ?? [],
-        crew_options: chatRows.crew_options ?? [],
-      });
-    }
-
-    // Update dots: previously selected -> gray, current -> green
+    // load
+    const msgs = readJSON<Msg[]>(keyMessages(id), []);
+    const st = readJSON<ConvState>(keyState(id), { job_description: '', address: '', time_window: '', budget_band: '', tasks: [], crew_options: [] });
+    setMessages(msgs);
+    setState(st);
+    // dot UI
     const prev = prevChatIdRef.current;
-    setChats((c) => c.map((it) => ({ ...it, dot: it.id === id ? 'green' : it.dot })));
-    if (prev && prev !== id) {
-      await supabase.from('chats').update({ status_dot: 'gray' }).eq('id', prev);
-    }
-    await supabase.from('chats').update({ status_dot: 'green' }).eq('id', id);
+    setChats((c) => {
+      const updated = c.map((it) => ({ ...it, dot: it.id === id ? 'green' : 'gray' }));
+      writeJSON(STORAGE_CHATS, updated);   // persist list with the new dot colors
+      return updated;
+    });
     prevChatIdRef.current = id;
     setLoadingChat(false);
   };
@@ -325,16 +256,18 @@ export default function CrewConnectPage() {
     );
     setMessages((m) => [...m, userMsg]);
     // Persist user message
-    const chatIdToUse = currentChatId ?? chats[0]?.id ?? null;
-    if (userId && chatIdToUse) {
-      await supabase.from("messages").insert({ chat_id: chatIdToUse, role: "user", text: userMsg.text, options: [] });
-      // If chat title is still New Chat, rename it to first user message
-      const chatEntry = chats.find((c) => c.id === chatIdToUse);
-      if (chatEntry && chatEntry.title === "New Chat") {
-        await supabase.from("chats").update({ title: userMsg.text }).eq("id", chatIdToUse);
-        setChats((c) => c.map((it) => (it.id === chatIdToUse ? { ...it, title: userMsg.text } : it)));
-      }
-    }
+    const cid = currentChatId ?? (() => { newChat(); return currentChatId; })();
+    if (!cid) return; // safety
+    // persist user message
+    const curMsgs = readJSON<Msg[]>(keyMessages(cid), []);
+    const nextMsgs = [...curMsgs, userMsg];
+    writeJSON(keyMessages(cid), nextMsgs);
+    // update chat title and meta if first message
+    setChats((c) => {
+      const updated = c.map((it) => it.id === cid ? { ...it, title: it.title === 'New Chat' ? userMsg.text : it.title, meta: 'Just now' } : it);
+      writeJSON(STORAGE_CHATS, updated);
+      return updated;
+    });
     setInput("");
     setSending(true);
 
@@ -356,21 +289,15 @@ export default function CrewConnectPage() {
         ...m,
         { role: "assistant", text: data.assistant_reply, options: suggestOptionsFor(data.assistant_reply) },
       ]);
-      if (userId && (currentChatId ?? chats[0]?.id)) {
-        const cid = currentChatId ?? chats[0]?.id as string;
-        await supabase.from("messages").insert({ chat_id: cid, role: "assistant", text: data.assistant_reply, options: suggestOptionsFor(data.assistant_reply) });
-        if (data?.state) {
-          const s = data.state;
-          await supabase.from("chats").update({
-            job_description: s.job_description ?? null,
-            address: s.address ?? null,
-            time_window: s.time_window ?? null,
-            budget_band: s.budget_band ?? null,
-            tasks: s.tasks ?? [],
-            crew_options: s.crew_options ?? [],
-            notes: s.notes ?? null,
-          }).eq("id", cid);
-        }
+      // persist assistant message
+      const cid2 = currentChatId as string;
+      const curMsgs2 = readJSON<Msg[]>(keyMessages(cid2), []);
+      const assistantMsg: Msg = { role: 'assistant', text: data.assistant_reply, options: suggestOptionsFor(data.assistant_reply) };
+      writeJSON(keyMessages(cid2), [...curMsgs2, assistantMsg]);
+      // persist state
+      if (data?.state) {
+        const merged = { ...readJSON<ConvState>(keyState(cid2), {} as any), ...data.state };
+        writeJSON(keyState(cid2), merged);
       }
       if (data?.state) setState(data.state);
       if (data?.done) afterDoneAnimations();
@@ -468,24 +395,7 @@ export default function CrewConnectPage() {
           <button
             className="w-[220px] h-10 rounded-xl bg-black text-white font-medium flex items-center justify-center gap-2"
             onClick={async () => {
-              if (!userId) {
-                newChat();
-                return;
-              }
-              const { data, error } = await supabase
-                .from("chats")
-                .insert({ user_id: userId, title: "New Chat", status_dot: "gray" })
-                .select("id, title, created_at, status_dot")
-                .single();
-              if (error || !data) {
-                console.warn("Supabase insert chat error", error?.message);
-                newChat();
-                return;
-              }
-              const item = { id: data.id as string, title: data.title as string, meta: new Date(data.created_at).toLocaleString(), dot: (data.status_dot as any) ?? "gray" } as ChatItem;
-              setChats((c) => [item, ...c]);
-              prevChatIdRef.current = currentChatId;
-              await openChat(item.id);
+              newChat();
             }}
           >
             + New Project
@@ -591,9 +501,17 @@ export default function CrewConnectPage() {
                     }
                   }}
                 />
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept="image/*,application/pdf"
+                  className="hidden"
+                  onChange={handleFilesChosen}
+                />
                 <button
-                  aria-label="Attach from camera"
-                  onClick={() => { /* hook up file/camera later */ }}
+                  aria-label="Attach files"
+                  onClick={handlePickFiles}
                   className="h-8 w-8 rounded-[20px] bg-blue-500 text-white grid place-items-center"
                 >
                   <Camera className="w-4 h-4" />
