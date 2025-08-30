@@ -1442,6 +1442,4 @@ function LocationModal({
     </div>
 
   );
-
-
 }
