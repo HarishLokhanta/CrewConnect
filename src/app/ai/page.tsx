@@ -3,6 +3,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Sun, Moon, Camera } from "lucide-react";
 import Image from "next/image";
+import { Inter } from 'next/font/google';
+const inter = Inter({ subsets: ['latin'] });
 
 /* ---------------- types ---------------- */
 type Msg = { role: "user" | "assistant" | "status"; text: string; options?: string[] };
@@ -122,6 +124,7 @@ function writeJSON(key: string, value: any) {
 /* --------------- page ----------------- */
 export default function CrewConnectPage() {
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [proposal, setProposal] = useState<{ resp: any; body: any } | null>(null);
   const [state, setState] = useState<ConvState>({
     job_description: "",
     address: "",
@@ -263,6 +266,7 @@ export default function CrewConnectPage() {
     setCurrentChatId(id);
     setCurrentChatId(id);
     setMessages([]);
+    setProposal(null);
     setState({ job_description: '', address: '', time_window: '', budget_band: '', tasks: [], crew_options: [] });
     locationPromptOnce.current = false;
   };
@@ -274,6 +278,7 @@ export default function CrewConnectPage() {
     setCurrentChatId(id);
     // clear
     setMessages([]);
+    setProposal(null);
     setState({ job_description: '', address: '', time_window: '', budget_band: '', tasks: [], crew_options: [] });
     // load
     const msgs = readJSON<Msg[]>(keyMessages(id), []);
@@ -358,7 +363,15 @@ export default function CrewConnectPage() {
         writeJSON(keyState(cid2), merged);
       }
       if (data?.state) setState(data.state);
-      if (data?.done) afterDoneAnimations();
+      if (data?.done) {
+        afterDoneAnimations();
+        const myEpoch2 = chatEpochRef.current;
+        // auto-run crew matching after the scoping Q&A finishes
+        setTimeout(() => {
+          if (myEpoch2 !== chatEpochRef.current) return; // ignore if user switched chats
+          runOptimiseUsingCurrentLocation();
+        }, 0);
+      }
     } catch {
       setMessages((m) => [...m, { role: "assistant", text: "Network error. Try again?" }]);
     } finally {
@@ -486,11 +499,10 @@ export default function CrewConnectPage() {
       const j = await r.json();
 
       if (j.status === 'ok') {
-        const lines = Object.entries(j.picks || {}).map(([task, w]: any) => `• ${task}: ${w.name}`);
+        setProposal({ resp: j, body });        // keep the full payload for UI
         setMessages(m => [
           ...m,
-          { role: 'status', text: '✅ Found matching crew near you:' },
-          { role: 'assistant', text: lines.join('\n') }
+          { role: 'status', text: '✅ Found matching crew near you:' }
         ]);
       } else {
         setMessages(m => [
@@ -510,7 +522,7 @@ export default function CrewConnectPage() {
   }, [messages]);
 
   return (
-    <div className={`h-screen w-screen overflow-hidden grid grid-cols-[280px_1fr] ${dark ? "bg-black text-white" : "bg-white text-black"}`}>
+    <div className={`${inter.className} h-screen w-screen overflow-hidden grid grid-cols-[280px_1fr] ${dark ? "bg-black text-white" : "bg-white text-black"}`}>
       {/* LEFT SIDEBAR */}
       <aside className={`flex flex-col border-r ${dark ? "border-gray-700 bg-black" : "border-gray-200 bg-white"}`}>
         <div className="h-[108px] px-4 flex items-center gap-3">
@@ -622,6 +634,7 @@ export default function CrewConnectPage() {
                   />
                 ))}
                 {sending && <TypingIndicator />}
+                {proposal && <MatchingProposal proposal={proposal} dark={dark} />}
                 <div ref={bottomAnchorRef} />
               </div>
             )}
@@ -733,6 +746,329 @@ function Hero({ onPick, dark }: { onPick: (t: string) => void; dark: boolean }) 
           <StarterInput label="Describe a project" icon="🏗️" onClick={() => onPick("Describe a project")} dark={dark} />
           <StarterInput label="Get installation help" icon="🔧" onClick={() => onPick("Get installation help")} dark={dark} />
           <StarterInput label="Something else" icon="✨" onClick={() => onPick("Something else")} dark={dark} />
+        </div>
+      </div>
+    </div>
+  );
+}
+function MatchingProposal({ proposal, dark }: { proposal: { resp: any; body: any }; dark: boolean }) {
+  const { resp, body } = proposal;
+
+  const [tab, setTab] = React.useState<'cheapest' | 'fastest' | 'greenest'>('cheapest');
+  const [showBooking, setShowBooking] = React.useState(false);
+
+  // show first three tasks by order (Plumber, Electrician, Tiler in your demo)
+  const orderedTasks = Array.isArray(body?.tasks) ? [...body.tasks].sort((a:any,b:any)=>a.order_idx-b.order_idx) : [];
+  const crew = orderedTasks.slice(0,3).map((t:any) => {
+    // choose worker based on tab:
+    // cheapest -> primary pick, fastest -> first backup if available, greenest -> second backup else first backup else pick
+    const backups = resp.backups?.[t.name] || [];
+    const chosen =
+      tab === 'cheapest' ? (resp.picks?.[t.name] || null)
+      : tab === 'fastest' ? (backups[0] || resp.picks?.[t.name] || null)
+      : (backups[1] || backups[0] || resp.picks?.[t.name] || null);
+    const w = chosen || {};
+    return {
+      role: t.name || t.skill,
+      name: w.name || '—',
+      rating: Number(w.rating_mean ?? 4.8).toFixed(1),
+      rate: Number(w.rate_hour ?? 120),
+      dur: Number(t?.duration_h ?? 1),
+    };
+  });
+
+  // estimate budget loosely from rate * duration; fall back to the screenshot range
+  let minBudget = 4200, maxBudget = 4800;
+  try {
+    const est = crew.reduce((s,c)=> s + c.rate * c.dur, 0);
+    if (est > 0) {
+      minBudget = Math.max(1000, Math.round(est * 0.9 / 100) * 100);
+      maxBudget = Math.round(est * 1.1 / 100) * 100;
+    }
+  } catch {}
+
+  const crewNames = crew.map(c => c.name).filter(Boolean).join(', ');
+  const projectTitle = body?.title || 'Bathroom Retile';
+  const timelineText = 'Start Tue · Finish Sun';
+
+  return (
+    <div
+      className="mt-6"
+      style={{
+        width: 'calc(100% - 300px)',   // align with card width
+        margin: '0 auto',
+        transform: 'scale(0.87)',
+        transformOrigin: 'top left'
+      }}
+    >
+      {/* Banner (outside the card) */}
+      <div className="mb-3">
+        <span className="ml-[120px] inline-flex items-center gap-2 text-[13px] px-3 py-1 rounded-full"
+              style={{backgroundColor:'#e8f5ee', color:'#15803d', border:'1px solid #bbf7d0'}}>
+          ✓ Found matching crew! Here’s your proposal:
+        </span>
+      </div>
+
+      {/* Tabs (outside the card) */}
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <button
+          onClick={() => setTab('cheapest')}
+          className={`rounded-xl border px-3 py-3 text-center ${tab === 'cheapest' ? '' : 'text-gray-500'}`}
+          style={tab === 'cheapest' ? { borderColor: '#bbf7d0', background: '#ecfdf5' } : {}}
+        >
+          <div className="text-sm font-semibold">$ Cheapest</div>
+          <div className="text-[12px]" style={tab === 'cheapest' ? { color: '#15803d' } : {}}>Best value option</div>
+        </button>
+        <button
+          onClick={() => setTab('fastest')}
+          className={`rounded-xl border px-3 py-3 text-center ${tab === 'fastest' ? '' : 'text-gray-500'}`}
+          style={tab === 'fastest' ? { borderColor: '#dbeafe', background: '#eff6ff' } : {}}
+        >
+          <div className="text-sm font-semibold">⚡ Fastest</div>
+          <div className="text-[12px]">Quickest completion</div>
+        </button>
+        <button
+          onClick={() => setTab('greenest')}
+          className={`rounded-xl border px-3 py-3 text-center ${tab === 'greenest' ? '' : 'text-gray-500'}`}
+          style={tab === 'greenest' ? { borderColor: '#bbf7d0', background: '#f0fdf4' } : {}}
+        >
+          <div className="text-sm font-semibold">🌱 Greenest</div>
+          <div className="text-[12px]">Most sustainable</div>
+        </button>
+      </div>
+
+      {/* Card */}
+      <div
+        className={`rounded-2xl border ${dark ? 'border-gray-700 bg-black' : 'border-gray-200 bg-white'} p-4`}
+      >
+        {/* Crew header */}
+        <div className="flex items-center justify-between px-1 py-2 border-b" style={{borderColor: dark ? '#374151' : '#e5e7eb'}}>
+          <div className="font-semibold">Proposed Crew</div>
+          <span className="text-[12px] px-2 py-[2px] rounded-full"
+                style={
+                  tab === 'cheapest'
+                    ? { color: '#2563eb', border: '1px solid #bfdbfe', background: '#eff6ff' }
+                    : tab === 'fastest'
+                      ? { color: '#ea580c', border: '1px solid #fed7aa', background: '#fff7ed' }
+                      : { color: '#15803d', border: '1px solid #bbf7d0', background: '#ecfdf5' }
+                }>
+            {tab === 'cheapest' ? 'Best Value' : tab === 'fastest' ? 'Quickest' : 'Most sustainable'}
+          </span>
+        </div>
+
+        {/* Crew rows - each in a rounded rectangle */}
+        <div>
+          {crew.map((c, idx) => (
+            <div
+              key={idx}
+              className="flex items-center justify-between py-3 px-3 mb-3 rounded-xl"
+              style={{
+                background: dark ? '#1f2937' : '#f9fafb',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.05)'
+              }}
+            >
+              <div className="flex items-center gap-3">
+                <div
+                  className="w-8 h-8 rounded-full"
+                  style={{ background: '#f2f2f2' }}
+                  aria-hidden
+                />
+                <div>
+                  <div className="text-sm font-semibold">{c.role}</div>
+                  <div className="text-xs text-gray-500">{c.name}</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-1 text-yellow-600 text-sm">
+                <span>★</span>
+                <span>{c.rating}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Start + budget */}
+        <div className="flex items-center gap-3 mt-3">
+          <div className="text-sm">Start Tue · Finish Sun</div>
+          <div className="text-sm font-semibold">$ {minBudget.toLocaleString()}–${maxBudget.toLocaleString()}</div>
+          <span className="text-[11px] border px-2 py-[2px] rounded-full text-gray-500">Estimate ±8%</span>
+        </div>
+
+        {/* Timeline */}
+        <div className="mt-3">
+          <div className="text-sm font-semibold mb-1">Project Timeline</div>
+          <div className="text-xs text-gray-500 mb-3">7 days total</div>
+
+          {(() => {
+            // one-line stacked bar with segments
+            const phases = [
+              { label: 'Rough-in',   days: 2, color: '#22c55e' },
+              { label: 'Waterproof', days: 1, color: '#60a5fa' },
+              { label: 'Tile',       days: 3, color: '#fbbf24' },
+              { label: 'Fit-off',    days: 1, color: '#a78bfa' },
+            ];
+            const total = phases.reduce((s, p) => s + p.days, 0);
+
+            return (
+              <>
+                <div
+                  className="w-full h-2 rounded bg-gray-200 overflow-hidden"
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={total}
+                  aria-valuenow={total}
+                >
+                  <div className="flex w-full h-2">
+                    {phases.map((p, i) => (
+                      <div
+                        key={i}
+                        style={{ width: `${(p.days / total) * 100}%`, background: p.color }}
+                        className="h-2"
+                        aria-hidden
+                      />
+                    ))}
+                  </div>
+                </div>
+                {/* segment labels */}
+                <div className="mt-3 grid grid-cols-4 gap-3">
+                  {phases.map((p, i) => (
+                    <div key={i} className="text-[11px]">
+                      <div className="inline-block w-3 h-2 rounded align-middle mr-1" style={{ background: p.color }} />
+                      <span className="align-middle">{p.label}</span>
+                      <span className="text-gray-500 ml-1">{p.days}d</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            );
+          })()}
+        </div>
+
+        {/* Footer */}
+        <div className="mt-4 flex items-center justify-between">
+          <button
+            onClick={() => setShowBooking(true)}
+            className="h-10 px-6 rounded-xl bg-black text-white font-medium"
+          >
+            Book
+          </button>
+          <button className="text-sm underline underline-offset-4">Why this team?</button>
+        </div>
+
+        <div className="mt-3 text-[11px] text-gray-500">
+          These dates fit your window and budget. You can tweak after booking.<br />
+          Optimized for cost savings
+        </div>
+      </div>
+      {/* Booking Modal */}
+      {showBooking && (
+        <BookingModal
+          onClose={() => setShowBooking(false)}
+          title={projectTitle}
+          timeline={timelineText}
+          minBudget={minBudget}
+          maxBudget={maxBudget}
+          crewNames={crewNames}
+          badge={tab === 'cheapest' ? 'Best Value' : tab === 'fastest' ? 'Quickest' : 'Most Sustainable'}
+          dark={dark}
+        />
+      )}
+    </div>
+  );
+}
+
+function BookingModal({
+  onClose,
+  title,
+  timeline,
+  minBudget,
+  maxBudget,
+  crewNames,
+  badge,
+  dark
+}: {
+  onClose: () => void;
+  title: string;
+  timeline: string;
+  minBudget: number;
+  maxBudget: number;
+  crewNames: string;
+  badge: string;
+  dark: boolean;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.35)' }}>
+      <div className={`w-[520px] max-w-[92vw] rounded-2xl ${dark ? 'bg-black border border-gray-700' : 'bg-white border border-gray-200'} shadow-xl`}>
+        {/* Header row with title + badge */}
+        <div className="p-5">
+          <div className="flex items-center justify-between">
+            <div className="text-[15px] font-semibold">Booking Summary</div>
+            <span className="text-[12px] px-2 py-[2px] rounded-full"
+                  style={{ color: '#2563eb', border: '1px solid #bfdbfe', background: '#eff6ff' }}>
+              {badge}
+            </span>
+          </div>
+
+          {/* Summary rows box */}
+          <div className={`mt-3 rounded-xl ${dark ? 'bg-black border border-gray-700' : 'bg-white border border-gray-200'}`}>
+            <div className="px-4 py-3 flex items-start justify-between">
+              <div className="text-gray-500">Project:</div>
+              <div className="font-medium">{title}</div>
+            </div>
+            <div className={`h-px ${dark ? 'bg-gray-800' : 'bg-gray-100'}`} />
+            <div className="px-4 py-3 flex items-start justify-between">
+              <div className="text-gray-500">Timeline:</div>
+              <div className="font-medium">{timeline}</div>
+            </div>
+            <div className={`h-px ${dark ? 'bg-gray-800' : 'bg-gray-100'}`} />
+            <div className="px-4 py-3 flex items-start justify-between">
+              <div className="text-gray-500">Price:</div>
+              <div className="text-right">
+                <div className="font-semibold">${minBudget.toLocaleString()}–${maxBudget.toLocaleString()}</div>
+                <div className="text-[11px] text-gray-500 text-right">Estimate ±12%</div>
+              </div>
+            </div>
+            <div className={`h-px ${dark ? 'bg-gray-800' : 'bg-gray-100'}`} />
+            <div className="px-4 py-3 flex items-start justify-between">
+              <div className="text-gray-500">Crew:</div>
+              <div className="font-medium">{crewNames || '—'}</div>
+            </div>
+          </div>
+
+          {/* Secure booking info box */}
+          <div className={`mt-4 rounded-xl ${dark ? 'bg-black border border-gray-700' : 'bg-white border border-gray-200'}`}>
+            <div className="px-4 py-3">
+              <div className="text-[13px] font-medium">🔒 Secure Booking Process</div>
+              <div className="text-[12px] text-gray-500">
+                This is a simulated booking for demonstration. No actual payment will be processed.
+              </div>
+            </div>
+          </div>
+
+          {/* Disabled Terms row */}
+          <div className="mt-3 text-[12px] text-gray-500 flex items-start gap-2 opacity-70">
+            <input type="checkbox" disabled className="mt-[3px]" />
+            <span>
+              I agree to the Terms of Service and understand this is a simulated booking for demonstration purposes.
+              I acknowledge that no actual payment will be processed.
+            </span>
+          </div>
+        </div>
+
+        {/* Footer actions */}
+        <div className={`px-5 py-4 flex items-center justify-between rounded-b-2xl ${dark ? 'bg-black border-t border-gray-800' : 'bg-white border-t border-gray-100'}`}>
+          <button
+            onClick={onClose}
+            className="h-10 px-5 rounded-xl border border-gray-300 hover:bg-gray-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onClose}
+            className="h-10 px-5 rounded-xl text-white"
+            style={{ background: '#111827' }}
+          >
+            Confirm &amp; Hold Deposit
+          </button>
         </div>
       </div>
     </div>

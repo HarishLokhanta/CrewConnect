@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "InterfaceGenie",
+  title: "CrewConnect",
   description: "AI UI preview",
 };
 
