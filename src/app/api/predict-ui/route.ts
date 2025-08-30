@@ -22,7 +22,7 @@ const FLOW: Array<{
 }> = [
   {
     key: "job_description",
-    question: "What exactly needs doing?",
+    question: "What exactly needs to be done?",
     options: ["Retile shower", "Replace vanity", "New power point", "Other"],
   },
   {
