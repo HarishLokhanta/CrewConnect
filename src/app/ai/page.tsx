@@ -1,423 +1,474 @@
 "use client";
-import React, { useEffect, useState, useRef, useMemo } from "react";
-import { toast } from "react-toastify";
-import { Send, Loader2, Plus, Mic, Paperclip, Scissors } from "lucide-react";
-import { supabase } from "../../lib/supabaseClient"; // single client
 
-/**
- * AI Preview Modal
- */
-export default function AiPreviewModal({
-  open = true,
-  onClose,
-  html = "",
-  onApply,
-}: {
-  open?: boolean;
-  onClose?: () => void;
-  html?: string;
-  onApply?: (html: string) => void;
-}) {
-  const [previewHtml, setPreviewHtml] = useState(html);
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Send } from "lucide-react";
 
-  const [uiPrompt, setUiPrompt] = useState("");
-  const [generatedUIs, setGeneratedUIs] = useState<string[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+/* ---------------- types ---------------- */
+type Msg = { role: "user" | "assistant" | "status"; text: string; options?: string[] };
+type ConvState = {
+  job_description?: string;
+  address?: string;
+  time_window?: string;
+  budget_band?: string;
+  tasks?: any[];
+  crew_options?: any[];
+};
 
-  // ----------------- Minimal Supabase-backed chat -----------------
-  type UiMsg = { role: "user" | "assistant"; text: string };
-  const [chats, setChats] = useState<{ id: string; title: string; messages: UiMsg[] }[]>([]);
-  const [currentChatId, setCurrentChatId] = useState<string | null>(null);
-  const currentChat = useMemo(
-    () => chats.find((c) => c.id === currentChatId) ?? { id: "", title: "InterfaceGenie", messages: [] as UiMsg[] },
-    [chats, currentChatId]
-  );
+/* -------------- helpers --------------- */
+function isAddressQuestion(t: string | undefined) {
+  if (!t) return false;
+  const s = t.toLowerCase();
+  return /where('| i)s the job|what('| i)s the address|address|location/.test(s);
+}
 
-  function getUserKey(): string {
-    if (typeof window === "undefined") return "demo";
-    let k = localStorage.getItem("demo_user_key");
-    if (!k) {
-      k = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
-      localStorage.setItem("demo_user_key", k);
-    }
-    return k;
+/** Simple client-side suggestion mapping (so chips sit directly under the AI message) */
+function suggestOptionsFor(promptText: string | undefined): string[] {
+  if (!promptText) return [];
+  const t = promptText.toLowerCase();
+
+  if (/what exactly needs doing|what kind of job/.test(t)) return ["Retile shower", "Replace vanity", "New power point", "Other"];
+  if (/type of property/.test(t)) return ["House", "Apartment"];
+  if (/where's the job|address|where is the job|what's the address/.test(t)) return [];
+  if (/when works|when would you like this done|time window/.test(t)) return ["Weekday", "Weekend", "Specific dates"];
+  if (/access constraints|any access/.test(t)) return ["Lift", "Stairs", "Parking", "None"];
+  if (/have materials/.test(t)) return ["I have materials", "I need materials", "Not sure yet"];
+  if (/budget/.test(t)) return ["<$3k", "$3–5k", "$5–8k", ">$8k", "Skip"];
+  return [];
+}
+
+function formatTimeNow() {
+  try {
+    return new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  } catch {
+    return "";
   }
+}
 
-  async function saveTranscript(chatId: string, messages: UiMsg[]) {
-    await supabase.from("simple_chats").update({ transcript: messages }).eq("id", chatId);
-  }
-  // ---------------------------------------------------------------
+/* --------------- page ----------------- */
+export default function CrewConnectPage() {
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [state, setState] = useState<ConvState>({
+    job_description: "",
+    address: "",
+    time_window: "",
+    budget_band: "",
+    tasks: [],
+    crew_options: [],
+  });
 
-  /* keep preview in-sync with prop */
-  useEffect(() => setPreviewHtml(html), [html]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
 
-  /* listen for insertElement messages */
+  // location modal state
+  const [showLocationPrompt, setShowLocationPrompt] = useState(false);
+  const [locationWorking, setLocationWorking] = useState(false);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const locationPromptOnce = useRef(false); // avoid popping repeatedly
+
+  // scrolling
+  const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    const handler = (e: MessageEvent) => {
-      if (e.data?.type === "insertElement" && e.data.data) {
-        setPreviewHtml((prev) => {
-          const doc = new DOMParser().parseFromString(prev, "text/html");
-          const container = (doc.getElementById("ai-content") as HTMLElement) || doc.body;
-          container.insertAdjacentHTML("beforeend", e.data.data);
-          return "<!DOCTYPE html>" + doc.documentElement.outerHTML;
-        });
-      }
-    };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
-  }, []);
+    bottomAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, sending]);
 
-  // Create a new chat row on mount
+  // Auto-kickoff: ask first question if user hasn't typed
   useEffect(() => {
+    let cancel = false;
     (async () => {
+      if (messages.length > 0) return;
+      setSending(true);
       try {
-        const user_key = getUserKey();
-        const { data, error } = await supabase
-          .from("simple_chats")
-          .insert({ user_key, title: "InterfaceGenie", transcript: [] })
-          .select()
-          .single();
-        if (error) throw error;
-        setChats([{ id: data.id, title: data.title ?? "InterfaceGenie", messages: [] }]);
-        setCurrentChatId(data.id);
-      } catch (e: any) {
-        toast.error(e?.message ?? "Failed to start chat");
+        const r = await fetch("/api/predict-ui", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: [], state }),
+        });
+        const data = await r.json();
+        if (cancel) return;
+        if (r.ok) {
+          setMessages([
+            { role: "assistant", text: data.assistant_reply, options: suggestOptionsFor(data.assistant_reply) },
+          ]);
+          if (data.state) setState(data.state);
+          if (data.done) afterDoneAnimations();
+        } else {
+          setMessages([{ role: "assistant", text: data.error || "Something went wrong." }]);
+        }
+      } catch {
+        if (!cancel) setMessages([{ role: "assistant", text: "Network error. Try again?" }]);
+      } finally {
+        if (!cancel) setSending(false);
       }
     })();
+    return () => { cancel = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Send: append user message, call Claude via /api/predict-ui, persist transcript
-  const handlePredictUI = async () => {
-    if (!uiPrompt.trim() || !currentChatId) return;
-    setLoading(true);
+  // If assistant asks for address, offer location modal (once per session)
+  useEffect(() => {
+    const last = [...messages].reverse().find((m) => m.role === "assistant");
+    if (!locationPromptOnce.current && last && isAddressQuestion(last.text) && !state.address) {
+      locationPromptOnce.current = true;
+      setShowLocationPrompt(true);
+    }
+  }, [messages, state.address]);
 
-    const userMsg: UiMsg = { role: "user", text: uiPrompt };
-
-    setChats((prev) =>
-      prev.map((c) => (c.id === currentChatId ? { ...c, messages: [...c.messages, userMsg] } : c))
-    );
+  // Unified sender (text or chip)
+  const sendMessage = async (text: string) => {
+    if (!text.trim() || sending) return;
+    const userMsg: Msg = { role: "user", text: text.trim() };
+    setMessages((m) => [...m, userMsg]);
+    setInput("");
+    setSending(true);
 
     try {
-      const prevChat = chats.find((c) => c.id === currentChatId);
-      const baseMessages = (prevChat?.messages ?? []).concat([userMsg]);
-      await saveTranscript(currentChatId, baseMessages);
-
-      // 👇 NEW: send state + messages to CrewConnect
-      const resp = await fetch("/api/predict-ui", {
+      const r = await fetch("/api/predict-ui", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          messages: baseMessages.map((m) => ({ role: m.role, content: m.text })),
-          state: {} // TODO: persist state in frontend if you want continuity
+          messages: [...messages, userMsg].map((m) => ({ role: m.role === "status" ? "assistant" : m.role, content: m.text })),
+          state,
         }),
       });
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.error || "Prediction failed");
+      const data = await r.json();
+      if (!r.ok) {
+        setMessages((m) => [...m, { role: "assistant", text: data.error || "Prediction failed." }]);
+        return;
       }
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", text: data.assistant_reply, options: suggestOptionsFor(data.assistant_reply) },
+      ]);
+      if (data?.state) setState(data.state);
+      if (data?.done) afterDoneAnimations();
+    } catch {
+      setMessages((m) => [...m, { role: "assistant", text: "Network error. Try again?" }]);
+    } finally {
+      setSending(false);
+    }
+  };
 
-      const data = await resp.json();
+  // After "done", show scoping progress
+  const afterDoneAnimations = () => {
+    setMessages((m) => [...m, { role: "status", text: "⚡  Starting project scoping…" }]);
+    setTimeout(() => setMessages((m) => [...m, { role: "status", text: "⚡  Finding the perfect crew for your project…" }]), 900);
+    setTimeout(() => setMessages((m) => [...m, { role: "status", text: "✅ Found matching crew! Here's your proposal:" }]), 1900);
+  };
 
-      // 👇 instead of generatedUIs, we use assistant_reply
-      const assistantMsg: UiMsg = {
-        role: "assistant",
-        text: data.assistant_reply,
-      };
+  const showHero = useMemo(() => messages.length === 0, [messages.length]);
 
-      setChats((prev) =>
-        prev.map((c) =>
-          c.id === currentChatId ? { ...c, messages: [...c.messages, assistantMsg] } : c
-        )
+  // --- geolocation flow ---
+  const handleUseMyLocation = async () => {
+    setLocationWorking(true);
+    setLocationError(null);
+
+    if (!("geolocation" in navigator)) {
+      setLocationWorking(false);
+      setLocationError("Your browser doesn’t support location.");
+      return;
+    }
+
+    const getPosition = () =>
+      new Promise<GeolocationPosition>((resolve, reject) =>
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 15000,
+          maximumAge: 0,
+        }),
       );
 
-      await saveTranscript(currentChatId, baseMessages.concat([assistantMsg]));
+    try {
+      const pos = await getPosition();
+      const { latitude, longitude } = pos.coords;
+
+      // Reverse geocode via Nominatim (OpenStreetMap)
+      const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}`;
+      const resp = await fetch(url, {
+        headers: {
+          // Nominatim asks for an identifying UA; keep it generic but present.
+          "Accept": "application/json",
+        },
+      });
+      const data = await resp.json();
+
+      const address =
+        data?.display_name ||
+        [data?.address?.house_number, data?.address?.road, data?.address?.suburb, data?.address?.city || data?.address?.town, data?.address?.state, data?.address?.postcode]
+          .filter(Boolean)
+          .join(", ");
+
+      if (!address) throw new Error("Couldn’t resolve address.");
+
+      // send address back into chat
+      setShowLocationPrompt(false);
+      await sendMessage(address);
     } catch (err: any) {
-      toast.error(err?.message ?? "Prediction failed");
+      setLocationError(err?.message || "Couldn’t get your location.");
     } finally {
-      setLoading(false);
-      setUiPrompt("");
-    }
-  };
-
-  if (!open) return null;
-
-  // Send only the inner HTML fragment to Draw.io.
-  const insertIntoDrawio = () => {
-    try {
-      const doc = new DOMParser().parseFromString(previewHtml, "text/html");
-      const fragment = doc.getElementById("ai-content")?.innerHTML || doc.body.innerHTML || previewHtml;
-      window.parent.postMessage({ type: "insertIntoDrawio", data: fragment.trim() }, "*");
-      toast.success("Sent snippet to Draw.io iframe");
-    } catch {
-      window.parent.postMessage({ type: "insertIntoDrawio", data: previewHtml }, "*");
-    }
-    onClose?.();
-  };
-
-  const copyToClipboard = async () => {
-    try {
-      await navigator.clipboard.writeText(previewHtml);
-      toast.success("HTML copied to clipboard");
-    } catch {
-      toast.error("Copy failed");
-    }
-  };
-
-  const handleApply = () => {
-    try {
-      const doc = new DOMParser().parseFromString(previewHtml, "text/html");
-      const fragment = doc.getElementById("ai-content")?.innerHTML || doc.body.innerHTML || previewHtml;
-      onApply?.(fragment.trim());
-      onClose?.();
-    } catch {
-      onApply?.(previewHtml);
-      onClose?.();
+      setLocationWorking(false);
     }
   };
 
   return (
-    <div className="fixed inset-0 z-[9999] bg-black/60 flex items-center justify-center">
-      <div className="w-11/12 md:w-[1100px] h-[90vh] bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-hidden flex">
-        {/* Sidebar */}
-        <aside className="hidden md:flex w-72 bg-[#F7F9FD] border-r border-gray-200 flex-col">
-          <div className="px-4 pt-4">
-            <div className="flex items-center gap-3 rounded-2xl border border-gray-300 bg-white px-3 py-3">
-              <div className="leading-tight">
-                <div className="text-xl font-extrabold italic text-black">InterfaceGenie AI</div>
-                <div className="text-base text-black">Premium Assistant</div>
-              </div>
-            </div>
-          </div>
-          <div className="p-4">
-            <button
-              onClick={async () => {
-                try {
-                  const { data, error } = await supabase
-                    .from("simple_chats")
-                    .insert({ user_key: getUserKey(), title: "InterfaceGenie", transcript: [] })
-                    .select()
-                    .single();
-                  if (error) throw error;
+    <div className="h-screen w-screen bg-white text-black grid grid-cols-[280px_1fr]">
+      {/* LEFT SIDEBAR */}
+      <aside className="border-r border-gray-200 bg-white flex flex-col">
+        <div className="px-4 py-3 flex items-center gap-2">
+          <div className="w-6 h-6 rounded-full border border-gray-300 grid place-items-center">○</div>
+          <div className="font-semibold">Crew Connect</div>
+        </div>
 
-                  const c = { id: data.id as string, title: data.title ?? "InterfaceGenie", messages: [] as UiMsg[] };
-                  setChats((prev) => [c, ...prev]);
-                  setCurrentChatId(c.id);
-                  setGeneratedUIs([]);
-                  setSelectedIdx(null);
-                  setPreviewHtml(
-                    '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><div id="ai-content"></div></body></html>'
-                  );
-                } catch (e: any) {
-                  toast.error(e?.message ?? "Failed to create chat");
-                }
-              }}
-              className="w-full h-10 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium flex items-center justify-center gap-2"
-            >
-              <Plus className="w-4 h-4" /> New Chat
-            </button>
-          </div>
-          <nav className="px-3 space-y-1 text-sm">
-            <div className="space-y-1">
-              {chats.map((chat) => (
-                <button
-                  key={chat.id}
-                  onClick={() => {
-                    setCurrentChatId(chat.id);
-                    setGeneratedUIs([]);
-                    setSelectedIdx(null);
-                  }}
-                  className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl border shadow-sm ${
-                    chat.id === currentChatId ? "bg-white border-blue-400" : "bg-white border-gray-200 hover:border-blue-200"
-                  }`}
-                >
-                  <span
-                    className={`w-2.5 h-2.5 rounded-full ${
-                      chat.id === currentChatId ? "bg-blue-600" : "bg-blue-300"
-                    }`}
-                  ></span>
-                  <span className="truncate text-black font-medium">{chat.title}</span>
-                </button>
-              ))}
-            </div>
-          </nav>
-          <div className="mt-auto p-4">
-            <div className="flex items-center gap-3 rounded-2xl border border-gray-300 bg-white px-3 py-3">
-              <div className="w-8 h-8 rounded-full bg-pink-300 text-black grid place-items-center text-sm font-semibold">C</div>
-              <div className="leading-tight">
-                <div className="text-sm font-medium text-black underline">Settings</div>
-                <div className="text-xs text-black">Preferences</div>
-              </div>
-            </div>
-          </div>
-        </aside>
+        <div className="px-4">
+          <button
+            className="w-full h-10 rounded-xl bg-black text-white font-medium flex items-center justify-center gap-2"
+            onClick={() => {
+              setMessages([]);
+              setState({ job_description: "", address: "", time_window: "", budget_band: "", tasks: [], crew_options: [] });
+              setTimeout(() => setMessages([]), 0);
+              locationPromptOnce.current = false;
+            }}
+          >
+            + New Project
+          </button>
+        </div>
 
-        {/* Chat panel */}
-        <section className="flex-1 flex flex-col bg-white">
-          {/* Top bar */}
-          <div className="flex items-center justify-between px-4 py-3 border-b">
-            <div>
-              <div className="font-semibold text-black">{currentChat.title}</div>
-              <div className="text-xs text-black">Online · Responds instantly</div>
-            </div>
-            <button
-              onClick={onClose}
-              className="w-8 h-8 flex items-center justify-center rounded-full bg-red-500 text-black text-sm hover:bg-red-600"
-              title="Close preview"
-            >
-              ×
-            </button>
+        <div className="px-3 pt-4 space-y-4 overflow-auto">
+          <ProjectItem title="Bathroom Retile" meta="2 days ago" dot="gray" />
+          <ProjectItem title="Kitchen Backsplash" meta="1 week ago" dot="black" />
+          <ProjectItem title="Power Point Install" meta="2 weeks ago" dot="green" />
+        </div>
+      </aside>
+
+      {/* RIGHT MAIN */}
+      <main className="flex flex-col">
+        {/* Top bar */}
+        <div className="h-12 border-b border-gray-200 flex items-center justify-between px-4 bg-white">
+          <div className="flex items-center gap-2">
+            <span className="text-lg font-semibold">New Project</span>
+            <span className="text-xs rounded-full border px-2 py-[2px] text-gray-600">Draft</span>
           </div>
+          <div className="text-sm text-gray-600">⚙️ Project Summary</div>
+        </div>
 
-          {/* Messages area */}
-          <div className="flex-1 overflow-auto p-6 space-y-4 bg-white">
-            {currentChat.messages.map((m, i) => (
-              <div key={i} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
-                <div
-                  className={
-                    m.role === "user"
-                      ? "max-w-[80%] rounded-2xl bg-blue-500 p-3 text-sm text-black shadow"
-                      : "max-w-[80%] rounded-2xl bg-gray-50 border border-gray-200 p-3 text-sm text-black shadow-sm"
-                  }
-                >
-                  {m.text}
-                </div>
-              </div>
-            ))}
-            {loading && (
-              <div className="flex items-center gap-2">
-                <div className="w-6 h-6 rounded-full bg-blue-100 grid place-items-center">🤖</div>
-                <div className="h-6 px-3 rounded-full bg-gray-100 flex items-center">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-black animate-bounce [animation-delay:-200ms]"></span>
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-black mx-1 animate-bounce"></span>
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-black animate-bounce [animation-delay:200ms]"></span>
-                </div>
-              </div>
-            )}
-
-            {/* Generated UI thumbnails */}
-            {generatedUIs.length > 0 && (
-              <div className="grid grid-cols-2 gap-2">
-                {generatedUIs.slice(0, 4).map((ui, idx) => (
-                  <label
-                    key={idx}
-                    className={`relative border rounded ${selectedIdx === idx ? "border-blue-600" : "border-gray-300"} cursor-pointer`}
-                  >
-                    <input
-                      type="radio"
-                      name="generatedUi"
-                      className="absolute top-1 right-1 z-10"
-                      checked={selectedIdx === idx}
-                      onChange={() => {
-                        setPreviewHtml(ui);
-                        setSelectedIdx(idx);
-                      }}
-                    />
-                    <iframe
-                      title={`ui-${idx}`}
-                      sandbox="allow-scripts allow-same-origin"
-                      srcDoc={ui}
-                      className="w-full h-[220px] border-0 rounded"
-                    />
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        try {
-                          const doc = new DOMParser().parseFromString(ui, "text/html");
-                          const styleEls = Array.from(doc.querySelectorAll("style, link[rel='stylesheet']"))
-                            .map((el) => (el as HTMLElement).outerHTML)
-                            .join("");
-                          const content = doc.getElementById("ai-content")?.innerHTML || doc.body.innerHTML || ui;
-                          const fullDoc = `<!DOCTYPE html><html><head><meta charset="utf-8">${styleEls}</head><body style="margin:0">${content.trim()}</body></html>`;
-                          onApply?.(fullDoc);
-                        } catch {
-                          onApply?.(ui);
-                        }
-                      }}
-                      className="absolute bottom-1 left-1 px-2 py-1 text-xs bg-blue-400 text-black rounded hover:bg-blue-500"
-                    >
-                      Apply
-                    </button>
-                  </label>
+        {/* Conversation area (keeps exact size with scrollbar) */}
+        <div className="flex-1 grid grid-rows-[1fr_auto]">
+          <div className="overflow-auto bg-white overscroll-contain">
+            {showHero ? (
+              <Hero onPick={(t) => sendMessage(t)} />
+            ) : (
+              <div className="max-w-3xl mx-auto w-full px-4 py-8 space-y-8 pb-32">
+                {messages.map((m, i) => (
+                  <MessageBubble
+                    key={i}
+                    role={m.role}
+                    text={m.text}
+                    options={m.options}
+                    onPick={(t) => sendMessage(t)}
+                  />
                 ))}
+                {sending && <TypingIndicator />}
+                <div ref={bottomAnchorRef} />
               </div>
             )}
           </div>
 
           {/* Composer */}
-          <div className="p-4 border-t bg-[#F7F9FD]">
-            <div className="flex items-center gap-2 bg-white border rounded-full px-3 py-2 shadow-sm">
-              <input
-                value={uiPrompt}
-                onChange={(e) => setUiPrompt(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && uiPrompt.trim()) handlePredictUI();
-                }}
-                placeholder="Ask InterfaceGenie anything..."
-                className="flex-1 h-9 px-1 text-sm text-black placeholder-black bg-transparent focus:outline-none"
-              />
-              <div
-                style={{
-                  backgroundColor: "#AAF064",
-                  border: "2px solid #000000",
-                  borderRadius: "50%",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  width: 36,
-                  height: 36,
-                  cursor: "pointer",
-                }}
-                title="Scissors"
-              >
-                <Scissors className="w-4 h-4" color="black" />
+          <div className="border-t border-gray-200 bg-white">
+            <div className="max-w-3xl mx-auto w-full px-4 py-3">
+              <div className="relative flex items-center gap-2 rounded-2xl border border-gray-300 bg-white px-4">
+                <input
+                  className="flex-1 h-12 outline-none text-[15px] placeholder:text-gray-400"
+                  placeholder="Describe what you need… (Press / to focus)"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      sendMessage(input);
+                    }
+                  }}
+                />
+                <button
+                  aria-label="Send"
+                  onClick={() => sendMessage(input)}
+                  className="h-8 w-8 rounded-full bg-black text-white grid place-items-center"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
               </div>
-              <div
-                style={{
-                  backgroundColor: "#FFFFFF",
-                  border: "2px solid #A0A0A0",
-                  borderRadius: "50%",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  width: 36,
-                  height: 36,
-                  cursor: "pointer",
-                }}
-                title="Voice"
-              >
-                <Mic className="w-4 h-4" color="black" />
+              <div className="text-[12px] text-gray-500 mt-2">
+                Press <kbd className="px-1 py-0.5 border rounded">Enter</kbd> to send,&nbsp;
+                <kbd className="px-1 py-0.5 border rounded">Shift</kbd> + <kbd className="px-1 py-0.5 border rounded">Enter</kbd> for new line,&nbsp;
+                <kbd className="px-1 py-0.5 border rounded">/</kbd> to focus
               </div>
-              <div
-                style={{
-                  backgroundColor: "#FFFFFF",
-                  border: "2px solid #A0A0A0",
-                  borderRadius: "50%",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  width: 36,
-                  height: 36,
-                  cursor: "pointer",
-                }}
-                title="Attach"
-              >
-                <Paperclip className="w-4 h-4" color="black" />
-              </div>
-              <button
-                onClick={handlePredictUI}
-                disabled={loading}
-                className={`w-9 h-9 flex items-center justify-center rounded-full ${
-                  loading ? "bg-gray-300" : "bg-blue-600 hover:bg-blue-700"
-                } text-white`}
-              >
-                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-              </button>
             </div>
           </div>
-        </section>
+        </div>
+      </main>
+
+      {/* Location modal (overlay, does not change layout size) */}
+      {showLocationPrompt && (
+        <LocationModal
+          busy={locationWorking}
+          error={locationError}
+          onClose={() => setShowLocationPrompt(false)}
+          onUseLocation={handleUseMyLocation}
+        />
+      )}
+    </div>
+  );
+}
+
+/* -------- UI bits -------- */
+
+function ProjectItem({ title, meta, dot }: { title: string; meta: string; dot: "gray" | "black" | "green" }) {
+  const color = dot === "green" ? "bg-green-500" : dot === "black" ? "bg-black" : "bg-gray-400";
+  return (
+    <button className="w-full text-left">
+      <div className="text-[13px] font-semibold">{title}</div>
+      <div className="text-[11px] text-gray-500">{meta}</div>
+      <div className={`mt-1 w-2 h-2 rounded-full ${color}`} />
+    </button>
+  );
+}
+
+function Hero({ onPick }: { onPick: (t: string) => void }) {
+  return (
+    <div className="h-full w-full grid place-items-center bg-white">
+      <div className="max-w-xl w-full text-center">
+        <div className="mx-auto w-28 h-28 rounded-full bg-gray-100 grid place-items-center">
+          <div className="text-3xl">🧰</div>
+        </div>
+        <h2 className="mt-6 text-[22px] font-semibold">Tell me what you need, and I’ll draft the plan.</h2>
+        <p className="text-gray-500 mt-1">Start by describing your project in a few words</p>
+
+        <div className="mt-6 space-y-3">
+          <StarterInput label="Retile shower" icon="📄" onClick={() => onPick("Retile shower")} />
+          <StarterInput label="Replace vanity" icon="🪛" onClick={() => onPick("Replace vanity")} />
+          <StarterInput label="Add power point" icon="⚡️" onClick={() => onPick("Add power point")} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StarterInput({ label, icon, onClick }: { label: string; icon: string; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="w-full h-12 rounded-xl border border-gray-300 bg-white hover:bg-gray-50 flex items-center gap-3 px-4 text-left"
+    >
+      <span className="w-5 text-center">{icon}</span>
+      <span className="text-[15px]">{label}</span>
+    </button>
+  );
+}
+
+function MessageBubble({
+  role,
+  text,
+  options = [],
+  onPick,
+}: {
+  role: "user" | "assistant" | "status";
+  text: string;
+  options?: string[];
+  onPick: (t: string) => void;
+}) {
+  if (role === "status") {
+    return (
+      <div className="flex justify-start">
+        <div className="rounded-2xl border border-gray-200 bg-white px-4 py-2 text-[14px] text-gray-700">{text}</div>
+      </div>
+    );
+  }
+
+  const isUser = role === "user";
+  const timeLabel = React.useMemo(() => formatTimeNow(), []);
+
+  return (
+    <div className={["max-w-[720px]", "w-full", "space-y-2", isUser ? "ml-auto" : ""].join(" ")}>
+      {/* bubble */}
+      <div className={["rounded-2xl", "px-4", "py-3", isUser ? "bg-black text-white rounded-br-md" : "bg-white border border-gray-200 text-black rounded-bl-md"].join(" ")}>
+        <div className="text-[15px] whitespace-pre-wrap">{text}</div>
+      </div>
+
+      {/* options BELOW the bubble for assistant only */}
+      {!isUser && options.length > 0 && (
+        <div className="flex flex-col items-start gap-1">
+          <div className="flex flex-wrap gap-2">
+            {options.map((opt, i) => (
+              <button
+                key={`${opt}-${i}`}
+                onClick={() => onPick(opt)}
+                className="rounded-full border border-gray-300 bg-white hover:bg-gray-50 px-3 py-1 text-[13px]"
+              >
+                {opt}
+              </button>
+            ))}
+          </div>
+          <div className="text-[12px] text-gray-500">{timeLabel}</div>
+        </div>
+      )}
+
+      {/* timestamp for user messages (under their bubble) */}
+      {isUser && <div className="text-[12px] text-gray-500 text-right">{timeLabel}</div>}
+    </div>
+  );
+}
+
+function TypingIndicator() {
+  return (
+    <div className="flex justify-start">
+      <div className="rounded-2xl border border-gray-200 bg-white px-4 py-3 text-black">
+        <div className="flex items-center gap-1">
+          <span className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-200ms]" />
+          <span className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-bounce" />
+          <span className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-bounce [animation-delay:200ms]" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- modal to request location permission ---------- */
+function LocationModal({
+  busy,
+  error,
+  onClose,
+  onUseLocation,
+}: {
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onUseLocation: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/20 backdrop-blur-[1px] flex items-center justify-center">
+      <div className="w-[460px] max-w-[92vw] bg-white rounded-2xl border border-gray-200 shadow-xl p-5">
+        <div className="text-[18px] font-semibold">Use your current location?</div>
+        <p className="text-sm text-gray-600 mt-1">
+          We’ll use your device’s location once to fill in the job address. You can also type it manually.
+        </p>
+
+        {error && <div className="mt-3 text-sm text-red-600">{error}</div>}
+
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="px-3 py-2 rounded-lg border border-gray-300 text-sm hover:bg-gray-50"
+            disabled={busy}
+          >
+            Not now
+          </button>
+          <button
+            onClick={onUseLocation}
+            className="px-3 py-2 rounded-lg bg-black text-white text-sm disabled:opacity-60"
+            disabled={busy}
+          >
+            {busy ? "Getting location…" : "Use my location"}
+          </button>
+        </div>
       </div>
     </div>
   );
