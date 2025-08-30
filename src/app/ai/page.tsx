@@ -1025,6 +1025,70 @@ function BookingModal({
   badge: string;
   dark: boolean;
 }) {
+  const [confirmed, setConfirmed] = React.useState(false);
+
+  // Generate a lightweight reference for the booking
+  const ref = React.useMemo(() => {
+    const n = Math.floor(Math.random() * 90000) + 10000;
+    return `BK-${n}`;
+  }, []);
+
+  if (confirmed) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.35)' }}>
+        <div className={`w-[520px] max-w-[92vw] rounded-2xl ${dark ? 'bg-black border border-gray-700' : 'bg-white border border-gray-200'} shadow-xl`}>
+          <div className="p-6 text-center">
+            <div className="mx-auto w-12 h-12 rounded-full grid place-items-center mb-3" style={{ background: '#dcfce7', color: '#16a34a' }}>✓</div>
+            <div className="text-[18px] font-semibold">Booking successful</div>
+            <div className="text-[13px] text-gray-500 mt-1">Your appointment has been scheduled.</div>
+
+            {/* Appointment details */}
+            <div className={`mt-4 text-left rounded-xl ${dark ? 'bg-black border border-gray-700' : 'bg-white border border-gray-200'}`}>
+              <div className="px-4 py-3 flex items-start justify-between">
+                <div className="text-gray-500">Project:</div>
+                <div className="font-medium">{title}</div>
+              </div>
+              <div className={`h-px ${dark ? 'bg-gray-800' : 'bg-gray-100'}`} />
+              <div className="px-4 py-3 flex items-start justify-between">
+                <div className="text-gray-500">Timeline:</div>
+                <div className="font-medium">{timeline}</div>
+              </div>
+              <div className={`h-px ${dark ? 'bg-gray-800' : 'bg-gray-100'}`} />
+              <div className="px-4 py-3 flex items-start justify-between">
+                <div className="text-gray-500">Price:</div>
+                <div className="font-medium">{priceLabel || '—'}</div>
+              </div>
+              <div className={`h-px ${dark ? 'bg-gray-800' : 'bg-gray-100'}`} />
+              <div className="px-4 py-3 flex items-start justify-between">
+                <div className="text-gray-500">Crew:</div>
+                <div className="font-medium">{crewNames || '—'}</div>
+              </div>
+              <div className={`h-px ${dark ? 'bg-gray-800' : 'bg-gray-100'}`} />
+              <div className="px-4 py-3 flex items-start justify-between">
+                <div className="text-gray-500">Reference:</div>
+                <div className="font-medium">{ref}</div>
+              </div>
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={onClose}
+                className="h-10 px-5 rounded-xl text-white"
+                style={{ background: '#111827' }}
+              >
+                Done
+              </button>
+            </div>
+
+            <div className="text-[11px] text-gray-500 mt-3">
+              You will also receive these details in your project thread.
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.35)' }}>
       <div className={`w-[520px] max-w-[92vw] rounded-2xl ${dark ? 'bg-black border border-gray-700' : 'bg-white border border-gray-200'} shadow-xl`}>
@@ -1093,7 +1157,7 @@ function BookingModal({
             Cancel
           </button>
           <button
-            onClick={onClose}
+            onClick={() => setConfirmed(true)}
             className="h-10 px-5 rounded-xl text-white"
             style={{ background: '#111827' }}
           >
