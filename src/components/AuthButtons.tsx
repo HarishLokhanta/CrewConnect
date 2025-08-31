@@ -1,4 +1,4 @@
-'use client';
+'use worker';
 
 import React from 'react';
 import AuthModal from './AuthModal';

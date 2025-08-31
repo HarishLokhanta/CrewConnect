@@ -1,5 +1,4 @@
-'use client';
-
+"use client";
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { Mail, Lock, Eye, EyeOff, Chrome, X } from 'lucide-react';
@@ -16,6 +15,7 @@ export default function AuthModal({ open, initialMode = 'login', onClose }: Auth
   const router = useRouter();
   const [mode, setMode] = useState<AuthMode>(initialMode);
   const [showPw, setShowPw] = useState(false);
+  const [userType, setUserType] = useState<'client' | 'worker'>('client');
 
   // keep mode in sync if parent changes initialMode
   useEffect(() => {
@@ -34,7 +34,11 @@ export default function AuthModal({ open, initialMode = 'login', onClose }: Auth
     e.preventDefault();
     // TODO: replace with real auth
     onClose();
-    router.push('/ai');
+    if (userType === 'worker') {
+      router.push('/worker');
+    } else {
+      router.push('/ai');
+    }
   };
 
   return (
@@ -59,6 +63,32 @@ export default function AuthModal({ open, initialMode = 'login', onClose }: Auth
         <h1 className="text-xl font-semibold text-center">
           {mode === 'login' ? 'Welcome back' : 'Create your account'}
         </h1>
+
+        {/* User Type Selection */}
+        <div className="flex justify-center gap-4 my-6">
+          <button
+            type="button"
+            className={`px-4 py-2 rounded-lg border font-medium ${
+              userType === 'client'
+                ? 'bg-white/20 border-white/20 text-white'
+                : 'bg-white/5 border-white/10 text-white/70'
+            }`}
+            onClick={() => setUserType('client')}
+          >
+            Client
+          </button>
+          <button
+            type="button"
+            className={`px-4 py-2 rounded-lg border font-medium ${
+              userType === 'worker'
+                ? 'bg-white/20 border-white/20 text-white'
+                : 'bg-white/5 border-white/10 text-white/70'
+            }`}
+            onClick={() => setUserType('worker')}
+          >
+            Worker
+          </button>
+        </div>
 
         {/* Form */}
         <form onSubmit={onSubmit} className="mt-6 space-y-3">
