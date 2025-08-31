@@ -8,6 +8,7 @@ const REQUIRED_FIELDS = ["job_description", "address", "time_window", "budget_ba
 type RequiredField = (typeof REQUIRED_FIELDS)[number];
 //comment
 // The fixed, desired flow (with chips)
+//
 const FLOW: Array<{
   key:
     | "job_description"
